@@ -1,0 +1,704 @@
+---
+title: "Predicting Tanzanian Water Pump Maintenance Needs"
+author: "Oswald Aguiar"
+date: "05/08/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#Packages
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+library(DataExplorer)
+library(skimr)
+library(visdat)
+library(vip)
+library(xgboost)
+library(kernlab)
+library(doParallel)
+library(foreach)
+library(ggmap)
+library(DALEXtra)
+theme_set(theme_minimal())
+doParallel::registerDoParallel(cores = 5)
+```
+
+# Loading dataset
+```{r}
+data <- read.csv('train_processed_final.csv')
+
+# Plot missing data
+vis_dat(data, warn_large_data = F)
+plot_missing(data)
+```
+
+
+# Initial data pre-processing
+```{r}
+# Convert construction_year with value 0 to NA 
+data[, 20:21][data[, 20:21] == '0'] <- NA
+
+data_clean <- data %>% 
+  select(id, amount_water, altitude_well, everything()) %>% 
+
+  drop_na(payment_type, installer, funder, quality_group,
+          quantity, management_group, source_class, id, construction_year) %>% 
+  
+  mutate(id = as.character(id)) %>%
+  
+  mutate_if(is.character,as.factor) %>%
+  
+  select(-public_meeting, -permit, -date_recorded,-waterpoint_name,
+         -subvillage, -region_code, -district_code, -management,
+         -source, -ward, -water_quality)
+
+# Convert all variables with 0 values to NA except columns - id, amount_water and altitide_well
+data_clean[, 4:20][data_clean[, 4:20] == '0'] <- NA
+
+data_clean <- data_clean %>% 
+  filter(well_status %in%  c('functional' , 'non functional')) %>% 
+  drop_na(installer, funder) %>% 
+  mutate(well_status = droplevels(well_status)) %>% 
+  filter(population>1) %>% 
+  mutate(id = as.character(id)) 
+
+# Plot missing data (no missing data now)
+
+plot_missing(data_clean)
+
+```
+
+# Splitting data into Test and Train and creating 5 fold CV
+```{r}
+set.seed(123)
+water_split <- initial_split(data_clean, strata = well_status)
+water_train <- training(water_split)
+water_test <- testing(water_split)
+
+# Cross-validation sets ---------------------------------------------------
+
+set.seed(234)
+water_folds <- vfold_cv(water_train, strata = well_status, v = 5)
+water_folds
+
+model_control <- control_grid(save_pred = TRUE, save_workflow = TRUE)
+
+```
+
+# Feature Extraction
+```{r}
+water_recipe_vip <- 
+  recipe(formula = well_status ~ . ,
+         data = water_train) %>% 
+  
+  update_role(id, new_role = "id") %>%
+  
+  step_unknown(all_nominal_predictors()) %>%
+  
+  step_novel(all_nominal(), -all_outcomes()) %>% 
+  
+  step_other(all_nominal_predictors(), threshold = 0.02,
+             other = 'non_frequent') %>%
+  
+  step_dummy(quantity, one_hot = T, -has_role("id")) %>%
+  step_zv(all_predictors()) %>% 
+  step_BoxCox(all_numeric_predictors()) %>% 
+  step_normalize(all_numeric_predictors(), -latitude, -longitude)
+
+water_prep_vip <- water_recipe_vip %>% 
+  prep() %>% 
+  juice()
+
+rf_spec_vip <- 
+  rand_forest() %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger") 
+
+vip_p <- rf_spec_vip %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(well_status ~ .,
+    data = water_prep_vip) %>% 
+  # select(-id)) %>%
+  vip(geom = "col", aesthetics = list(fill = "midnightblue", alpha = 0.8))
+
+vip_i <- rf_spec_vip %>%
+  set_engine("ranger", importance = "impurity") %>%
+  fit(well_status ~ .,
+      data = water_prep_vip) %>% 
+  # select(-id)) %>%
+  vip(geom = "col", aesthetics = list(fill = "midnightblue", alpha = 0.8))
+```
+
+# Further data pre-processing
+```{r}
+
+water_recipe <- 
+  recipe(formula = well_status ~ altitude_well + longitude + latitude + 
+           construction_year + quantity + population + id ,
+         data = water_train) %>% 
+  
+  update_role(id, new_role = "id") %>%
+
+  step_unknown(all_nominal_predictors()) %>%
+  
+  step_novel(all_nominal(), -all_outcomes()) %>% 
+
+  step_other(all_nominal_predictors(), threshold = 0.02,
+             other = 'non_frequent') %>%
+
+  step_dummy(quantity, one_hot = T, -has_role("id")) %>%
+  step_zv(all_predictors()) %>% 
+  step_BoxCox(all_numeric_predictors()) %>% 
+  step_normalize(all_numeric_predictors(), -latitude, -longitude) 
+
+water_prep <- water_recipe %>% 
+  prep() %>% 
+  juice()
+
+```
+
+# Simple Logistic model
+```{r}
+glm_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+glm_wflow <- 
+  workflow() %>% 
+  add_recipe(water_recipe) %>% 
+  add_model(glm_spec)
+
+set.seed(123)
+glm_rs <-  
+  fit_resamples(glm_wflow,
+                resamples = water_folds,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = control_resamples(save_pred = TRUE))
+
+collect_metrics(glm_rs) # Performance on resamples(training data)
+
+# Evaluating model performance on test data
+
+glm_final <- glm_wflow %>%
+  last_fit(water_split)
+
+collect_metrics(glm_final) #Performance on Test data
+
+```
+
+
+# Logistic model tuned
+```{r}
+
+glm_spec_t <- logistic_reg(penalty = tune(),
+                           mixture = tune()) %>%
+  set_engine("glmnet")
+
+glm_grid <- grid_regular(penalty (),
+                         mixture (),
+                         levels = 3)
+
+
+glm_wflow_t <-
+  workflow() %>%
+  add_recipe(water_recipe) %>%
+  add_model(glm_spec_t)
+
+set.seed(123)
+glm_rs_t <-
+  tune_grid(glm_wflow_t,
+                resamples = water_folds,
+                grid = glm_grid,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = model_control)
+
+collect_metrics(glm_rs_t) # Tuned performance on resamples(training data)
+
+show_best(glm_rs_t, "roc_auc") # Best hyperparameters from grid search
+
+final_params_glm <- select_best(glm_rs_t, "roc_auc") #select best hyperparameters
+
+final_glm <- finalize_workflow(
+  glm_wflow_t,
+  final_params_glm
+) #updating workflow with best parameters
+
+final_fitted_glm <- last_fit(final_glm, water_split) # fitting final workflow to train and test together
+
+collect_metrics(final_fitted_glm) # Test set accuracy
+
+```
+
+# Simple Decision Tree model
+```{r}
+
+dtree_spec <- decision_tree() %>%                
+  set_engine("rpart") %>%                
+  set_mode("classification")
+
+dtree_wflow <- 
+  workflow() %>% 
+  add_recipe(water_recipe) %>% 
+  add_model(dtree_spec) 
+
+set.seed(123)
+dtree_rs <-
+  fit_resamples(dtree_wflow,
+                resamples = water_folds,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = control_resamples(save_pred = TRUE))
+
+collect_metrics(dtree_rs) # Performance on resamples(training data)
+
+# Evaluating model performance on test data
+
+dtree_final <- dtree_wflow %>%
+  last_fit(water_split)
+
+collect_metrics(dtree_final) #Performance on Test data
+
+```
+# Decision Tree tuned 
+```{r}
+dtree_spec_t <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+dtree_grid <- grid_regular(cost_complexity(), 
+                           tree_depth(), 
+                           min_n(), 
+                           levels = 3)
+
+dtree_wflow_t <- 
+  workflow() %>% 
+  add_recipe(water_recipe) %>% 
+  add_model(dtree_spec_t)
+
+set.seed(123)
+dtree_rs_t <-
+  tune_grid(dtree_wflow_t,
+                resamples = water_folds,
+                grid = dtree_grid,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = model_control)
+
+collect_metrics(dtree_rs_t) # Tuned performance on resamples(training data)
+
+show_best(dtree_rs_t, "roc_auc") # Best hyperparameters from grid search
+
+final_params_dtree <- select_best(dtree_rs_t, "roc_auc") #select best hyperparameters
+
+final_dtree <- finalize_workflow(
+  dtree_wflow_t,
+  final_params_dtree
+) #updating workflow with best parameters
+
+final_fitted_dtree <- last_fit(final_dtree, water_split) # fitting final workflow to train and test together
+
+collect_metrics(final_fitted_dtree) # Test set accuracy
+```
+
+
+
+
+
+# Simple Random Forest model 
+```{r}
+
+rf_spec <- 
+  rand_forest() %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger") 
+
+rf_wflow <- 
+  workflow() %>% 
+  add_recipe(water_recipe) %>% 
+  add_model(rf_spec) 
+
+set.seed(123)
+rf_rs <-
+  fit_resamples(rf_wflow,
+                resamples = water_folds,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = control_resamples(save_pred = TRUE))
+
+collect_metrics(rf_rs) # Performance on resamples(training data)
+
+# Evaluating model performance on test data
+
+rf_final <- rf_wflow %>%
+  last_fit(water_split)
+
+collect_metrics(rf_final) #Performance on Test data
+```
+
+# Random Forest tuned
+```{r}
+rf_spec_t <- 
+  rand_forest(trees = tune(),
+              min_n = tune(),
+              mtry = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+               
+
+rf_grid <- grid_regular(trees(), 
+                        min_n(), 
+                        finalize(mtry(), water_train),
+                        levels = 3,
+                        filter = c(trees > 1))
+
+rf_wflow_t <- 
+  workflow() %>% 
+  add_recipe(water_recipe) %>% 
+  add_model(rf_spec_t) 
+
+set.seed(123)
+rf_rs_t <-
+  tune_grid(rf_wflow_t,
+                resamples = water_folds,
+                grid = rf_grid,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = model_control)
+
+collect_metrics(rf_rs_t) # Tuned performance on resamples(training data)
+
+show_best(rf_rs_t, "roc_auc") # Best hyperparameters from grid search
+
+final_params_rf <- select_best(rf_rs_t, "roc_auc") #select best hyperparameters
+
+final_rf <- finalize_workflow(
+  rf_wflow_t,
+  final_params_rf
+) #updating workflow with best parameters
+
+final_fitted_rf <- last_fit(final_rf, water_split) # fitting final workflow to train and test together
+
+collect_metrics(final_fitted_rf) # Test set accuracy
+```
+
+# Simple XGboost model
+```{r}
+xgb_spec <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wflow <-
+  workflow() %>%
+  add_recipe(water_recipe) %>%
+  add_model(xgb_spec)
+
+set.seed(123)
+xgb_rs <-
+  fit_resamples(xgb_wflow,
+                resamples = water_folds,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = control_resamples(save_pred = TRUE))
+
+collect_metrics(xgb_rs) # Performance on resamples(training data)
+
+# Evaluating model performance on test data
+
+xgb_final <- xgb_wflow %>%
+  last_fit(water_split)
+
+collect_metrics(xgb_final) #Performance on Test data
+```
+
+# Xgboost tuned 
+```{r}
+xgb_spec_t <- boost_tree(trees = tune(),
+                       learn_rate = tune(),
+                       tree_depth = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_grid <- grid_regular(trees (),
+                         learn_rate (),
+                         tree_depth (),
+                         levels = 3,
+                         filter = c(trees > 1))
+
+xgb_wflow_t <-
+  workflow() %>%
+  add_recipe(water_recipe) %>%
+  add_model(xgb_spec_t)
+
+set.seed(123)
+xgb_rs_t <-
+  tune_grid(xgb_wflow_t,
+                resamples = water_folds,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                grid = xgb_grid,
+                control = model_control)
+
+collect_metrics(xgb_rs_t) # Tuned performance on resamples(training data)
+
+show_best(xgb_rs_t, "roc_auc") # Best hyperparameters from grid search
+
+final_params_xgb <- select_best(xgb_rs_t, "roc_auc") #select best hyperparameters
+
+final_xgb <- finalize_workflow(
+  xgb_wflow_t,
+  final_params_xgb
+) #updating workflow with best parameters
+
+final_fitted_xgb <- last_fit(final_xgb, water_split) # fitting final workflow to train and test together
+
+collect_metrics(final_fitted_xgb) # Test set accuracy
+
+```
+
+
+# Simple Neural Network model
+```{r}
+
+nnet_spec <-
+  mlp() %>%
+  set_mode("classification") %>% 
+  set_engine("nnet")
+
+nnet_wflow <-
+  workflow() %>%
+  add_recipe(water_recipe) %>%
+  add_model(nnet_spec)
+
+set.seed(123)
+nnet_rs <-
+  fit_resamples(nnet_wflow,
+                resamples = water_folds,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                control = control_resamples(save_pred = TRUE))
+
+collect_metrics(nnet_rs) # Performance on resamples(training data)
+
+# Evaluating model performance on test data
+
+nnet_final <- nnet_wflow %>%
+  last_fit(water_split)
+
+collect_metrics(nnet_final) #Performance on Test data
+
+```
+
+# Neural Network Tuned
+```{r}
+nnet_spec_t <-
+  mlp(hidden_units = tune(),
+      penalty = tune(),
+      epochs = tune()) %>%
+  set_mode("classification") %>% 
+  set_engine("nnet")
+
+nnet_grid <- grid_regular(hidden_units (),
+                          penalty (),
+                          epochs (),
+                          levels = 3)
+
+nnet_wflow_t <-
+  workflow() %>%
+  add_recipe(water_recipe) %>%
+  add_model(nnet_spec_t)
+
+set.seed(123)
+nnet_rs_t <-
+  tune_grid(nnet_wflow_t,
+                resamples = water_folds,
+                metrics = metric_set(accuracy, roc_auc,sensitivity,
+                                     specificity),
+                grid = nnet_grid,
+                control = model_control)
+
+collect_metrics(nnet_rs_t) # Tuned performance on resamples(training data)
+
+show_best(nnet_rs_t, "roc_auc") # Best hyperparameters from grid search
+
+final_params_nnet <- select_best(nnet_rs_t, "roc_auc") #select best hyperparameters
+
+final_nnet <- finalize_workflow(
+  nnet_wflow_t,
+  final_params_nnet
+) #updating workflow with best parameters
+
+final_fitted_nnet <- last_fit(final_nnet, water_split) # fitting final workflow to train and test together
+
+collect_metrics(final_fitted_nnet) # Test set accuracy
+```
+
+# roc_auc plot for all untuned models
+```{r}
+
+glm_auc <- 
+  glm_final %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Logistic Regression")
+
+dtree_auc <- 
+  dtree_final %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Decision Tree")
+
+rf_auc <- 
+  rf_final %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Random Forest")
+
+xgb_auc <- 
+  xgb_final %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "XGboost")
+
+nnet_auc <- 
+  nnet_final %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Neural Network")
+
+roc_auc_simple <- bind_rows(glm_auc, dtree_auc, rf_auc, xgb_auc, nnet_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "magma", end = .6)
+
+```
+
+# roc_auc plot for all tuned models
+```{r}
+
+glm_auc_t <- 
+  final_fitted_glm %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Logistic Regression")
+
+dtree_auc_t <- 
+  final_fitted_dtree %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Decision Tree")
+
+rf_auc_t <- 
+  final_fitted_rf %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Random Forest")
+
+xgb_auc_t <- 
+  final_fitted_xgb %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "XGboost")
+
+nnet_auc_t <- 
+  final_fitted_nnet %>% 
+  collect_predictions() %>% 
+  roc_curve(well_status, .pred_functional) %>% 
+  mutate(model = "Neural Network")
+
+roc_auc_t <- bind_rows(glm_auc_t, dtree_auc_t, rf_auc_t, xgb_auc_t, nnet_auc_t) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "magma", end = .6)
+
+```
+
+# Building a map
+```{r}
+
+bbox <- c(left = 29.60712, bottom = -11.64944018, 
+          right = 40.34519, top = -0.00000002)
+
+tanzaniz_map <- get_stamenmap(bbox, zoom = 6)
+
+data1 <- data %>% 
+  filter(well_status %in% c("functional", "non functional")) 
+
+map <- ggmap(tanzaniz_map) +
+  geom_point(aes(longitude, latitude, color = well_status),
+             data = data1, alpha = 0.3) +
+  coord_fixed() +
+  guides(color = guide_legend(override.aes = list(alpha = 1)))+
+  scale_color_viridis_d()+
+  theme(legend.position = "top")
+
+```
+
+# Building a hex map
+```{r}
+
+map_pred <- xgb_rs_t %>%
+  collect_predictions() %>%
+  mutate(correct = well_status == .pred_class) %>%
+  left_join(water_prep %>% select(-id) %>% 
+              mutate(.row = row_number()))
+
+
+hex_map <- ggmap(tanzaniz_map)+
+  coord_cartesian()+
+stat_summary_hex(
+  data = map_pred %>% filter(
+                              well_status %in% c("functional", "non functional")),
+  aes(longitude, latitude, z = as.integer(correct)),
+  fun = "mean",
+  alpha = 0.9, bins = 50
+) +
+  scale_fill_gradient(high = 'olivedrab1', labels = scales::percent) +
+  # theme_void(base_family = "IBMPlexSans") +
+  labs(x = NULL, y = NULL, fill = "Percent classified\ncorrectly")
+
+```
+
+
+# Interpretability of instance level observations using random forest
+```{r}
+data_clean$well_status <- ifelse(data_clean$well_status == "functional",1,0)
+
+data_clean <- data_clean %>% 
+  mutate(well_status = as.factor(well_status))
+
+rf_wflow <- 
+  workflow() %>% 
+  add_recipe(water_recipe) %>% 
+  add_model(rf_spec) 
+
+
+rf_dlx <- rf_wflow %>% 
+  fit(data = data_clean)
+
+exp_dlx <- explain_tidymodels(rf_dlx, data = data_clean, y = as.numeric(data_clean$well_status))
+
+plot(predict_parts(exp_dlx, data_clean[21999,,drop = FALSE]))
+
+```
+
+
+
+
+
+
